@@ -11,7 +11,7 @@ COPY babel.config.js babel.config.js
 
 RUN npm run build
 
-RUN npm ci --only=production
+RUN npm prune --production
 RUN rm -rf src
 
 VOLUME /etc/dns-proxy
