@@ -2,13 +2,81 @@ import dgram from 'dgram';
 import packet from 'dns-packet';
 import _ from 'lodash';
 import config from './config';
+import ip from 'ip';
 
-const selectServer = domain => {
+const selectServer = query => {
+    const domain = query.questions?.[0]?.name;
+    let ipAddr = null;
+    if (domain.endsWith('.in-addr.arpa')) {
+        const [p1 = 0, p2 = 0, p3 = 0, p4 = 0] = domain
+            .substring(0, domain.length - 13)
+            .split('.')
+            .reverse();
+        ipAddr = `${p1}.${p2}.${p3}.${p4}`;
+    }
     for (const serverConfig of config.servers) {
         if (domain.endsWith(`.${serverConfig.domain}`)) {
             return serverConfig;
         }
+        const subnet = serverConfig.subnet;
+        if (ipAddr && subnet && ip.cidrSubnet(subnet).contains(ipAddr)) {
+            return  serverConfig;
+        }
     }
+    return {
+        nameserver: '192.168.233.1'
+    }
+};
+
+const processQuery = ({ query: _query, nameserverConfig }) => {
+    const query = _.cloneDeep(_query);
+    const domain = query.questions?.[0]?.name;
+    const queryType = query.questions?.[0]?.type;
+    const localDomain = nameserverConfig.localDomain ?? nameserverConfig.domain;
+    const additionalDot = localDomain.length !== 0 ? "." : "";
+
+    switch (queryType) {
+        case "A": { // change url to local domain of nameserver
+            const index = domain.lastIndexOf(`.${nameserverConfig.domain}`);
+            query.questions[0].name = domain.substring(0, index) + `${additionalDot}${localDomain}`;
+            break;
+        }
+        default: break;
+    }
+
+    return query;
+};
+
+const processResponse = ({ response: _response, nameserverConfig }) => {
+    const response = _.cloneDeep(_response);
+    const queryType = response.questions?.[0]?.type;
+    const localDomain = nameserverConfig.localDomain ?? nameserverConfig.domain;
+    const additionalDot = localDomain.length !== 0 ? "." : "";
+
+    switch (queryType) {
+        case "A": { // change url back to origin
+            const domain = response.questions[0].name;
+            const index = domain.lastIndexOf(`${additionalDot}${localDomain}`);
+            response.questions[0].name = domain.substring(0, index) + `.${nameserverConfig.domain}`;
+            response.answers.forEach(answer => {
+                const index = answer.name.lastIndexOf(`${additionalDot}${localDomain}`);
+                answer.name = answer.name.substring(0, index) + `.${nameserverConfig.domain}`;
+            });
+            break;
+        }
+        case "PTR": {
+            response.answers.forEach(answer => {
+                const index = answer.data.lastIndexOf(`${additionalDot}${localDomain}`);
+                answer.data = answer.data.substring(0, index) + `.${nameserverConfig.domain}`;
+            });
+            break;
+        }
+        default: break;
+    }
+    response.authorities = [];
+    response.additionals = [];
+
+    return response;
 };
 
 const proxyRequest = ({query, nameserver, port}) => new Promise((resolve, reject) => {
@@ -38,7 +106,7 @@ server.on('message', (queryBuffer, rinfo) => {
     const query = packet.decode(queryBuffer);
     const queryDomain = query.questions?.[0]?.name;
     console.log(`${requestId} :: request for ${queryDomain} from ${rinfo.address}:${rinfo.port}`);
-    const nameserverConfig = selectServer(queryDomain);
+    const nameserverConfig = selectServer(query);
     if (!nameserverConfig) {
         console.log(`${requestId} :: No server found for ${queryDomain}`);
         const modifiedResponseBuffer = packet.encode({
@@ -55,29 +123,11 @@ server.on('message', (queryBuffer, rinfo) => {
     const [nameserver, port = 53] = nameserverConfig.nameserver.split(':');
     console.log(`${requestId} :: Using ${nameserver}:${port} to resolve ${queryDomain}`);
 
-    const localDomain = _.get(nameserverConfig, "localDomain", `.${nameserverConfig.domain}`);
-    { // change url to local domain of nameserver
-        const index = queryDomain.lastIndexOf(`.${nameserverConfig.domain}`);
-        query.questions[0].name = queryDomain.substring(0, index) + localDomain;
-    }
-
-    return proxyRequest({query: query, nameserver, port})
+    const processedQuery = processQuery({ query, nameserverConfig });
+    return proxyRequest({ query: processedQuery, nameserver, port })
         .then(response => {
-            const responseDomain = response.questions[0].name;
-
-            { // change url back to origin
-                const additionalDot = localDomain.length === 0 ? "." : "";
-                const index = queryDomain.lastIndexOf(`${additionalDot}${localDomain}`);
-                response.questions[0].name = responseDomain.substring(0, index) + `.${nameserverConfig.domain}`;
-                response.answers.forEach(answer => {
-                    const answerIndex = answer.name.lastIndexOf(localDomain);
-                    answer.name = answer.name.substring(0, answerIndex) + `.${nameserverConfig.domain}`;
-                });
-                response.authorities = [];
-                response.additionals = [];
-            }
-
-            const modifiedResponseBuffer = packet.encode(response);
+            const processedResponse = processResponse({ response, nameserverConfig });
+            const modifiedResponseBuffer = packet.encode(processedResponse);
             server.send(modifiedResponseBuffer, 0, modifiedResponseBuffer.length, rinfo.port, rinfo.address);
         })
         .catch(err => {
