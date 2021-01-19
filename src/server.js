@@ -23,9 +23,6 @@ const selectServer = query => {
             return  serverConfig;
         }
     }
-    return {
-        nameserver: '192.168.233.1'
-    }
 };
 
 const processQuery = ({ query: _query, nameserverConfig }) => {
